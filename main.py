@@ -5,6 +5,7 @@ import queue
 import sys
 import time
 from datetime import datetime
+import os
 import discord
 from discord import app_commands, ButtonStyle
 from discord.ui import View, Button
@@ -13,273 +14,340 @@ import meshtastic.serial_interface
 import pytz
 from pubsub import pub
 
+# ---------------- Config ----------------
 def load_config():
     try:
-        with open("config.json", "r") as config_file:
-            config = json.load(config_file)
+        with open("config.json", "r") as f:
+            config = json.load(f)
             config["channel_names"] = {int(k): v for k, v in config["channel_names"].items()}
             return config
-    except FileNotFoundError:
-        logging.critical("The config.json file was not found.")
-        raise
-    except json.JSONDecodeError:
-        logging.critical("config.json is not a valid JSON file.")
-        raise
     except Exception as e:
-        logging.critical(f"An unexpected error occurred while loading config.json: {e}")
+        logging.critical(f"Error loading config.json: {e}")
         raise
 
 config = load_config()
+TOKEN = config["discord_bot_token"]
+CHANNEL_ID = int(config["discord_channel_id"])
+CHANNEL_NAMES = config["channel_names"]
+TIME_ZONE = config["time_zone"]
+MESHTASTIC_PORT = "/dev/ttyACM0"
+WX_FILE = config.get("wx_file")
 
-color = 0x67ea94  # Meshtastic Green
+COLOR = 0x67ea94  # Meshtastic green
 
-token = config["discord_bot_token"]
-channel_id = int(config["discord_channel_id"])
-channel_names = config["channel_names"]
-time_zone = config["time_zone"]
-
+# ---------------- Queues ----------------
 meshtodiscord = queue.Queue()
 discordtomesh = queue.Queue()
 nodelistq = queue.Queue()
 
-def onConnectionMesh(interface, topic=pub.AUTO_TOPIC):
-    print(interface.myInfo)
-
+# ---------------- Helper Functions ----------------
 def get_long_name(node_id, nodes):
     if node_id in nodes:
         return nodes[node_id]['user'].get('longName', 'Unknown')
     return 'Unknown'
 
-def onReceiveMesh(packet, interface):  # Called when a packet arrives from mesh.
+def onConnectionMesh(interface, topic=pub.AUTO_TOPIC):
+    logging.info(f"Connected to mesh: {interface.myInfo}")
+
+def onReceiveMesh(packet, interface):
     try:
-        if packet['decoded']['portnum'] == 'TEXT_MESSAGE_APP':
-            print("Text message packet received") # For debugging.
-            print(f"Packet: {packet}") # Print the entire packet for debugging.
+        if 'decoded' not in packet:
+            logging.warning(f"Received packet without 'decoded': {packet}")
+            return
 
-            # Check if 'channel' is present in the top-level packet.
-            if 'channel' in packet:
-                channel_index = packet['channel']
-            else:
-                # Check if 'channel' is present in the decoded packet.
-                if 'channel' in packet['decoded']:
-                    channel_index = packet['decoded']['channel']
-                else:
-                    channel_index = 0  # Default to channel 0 if not present.
-                    print("Channel not found in packet, defaulting to channel 0") # For debugging.
+        if packet['decoded'].get('portnum') != 'TEXT_MESSAGE_APP':
+            return
 
-            channel_name = channel_names.get(channel_index, f"Unknown Channel ({channel_index})")
+        channel_index = packet.get('channel', packet['decoded'].get('channel', 0))
+        channel_name = CHANNEL_NAMES.get(channel_index, f"Unknown Channel ({channel_index})")
 
-            current_time = datetime.now().strftime('%d %B %Y %I:%M:%S %p')
+        nodes = interface.nodes
+        from_long = get_long_name(packet['fromId'], nodes)
+        to_long = 'All Nodes' if packet['toId'] == '^all' else get_long_name(packet['toId'], nodes)
 
-            nodes = interface.nodes
-            from_long_name = get_long_name(packet['fromId'], nodes)
-            to_long_name = get_long_name(packet['toId'], nodes) if packet['toId'] != '^all' else 'All Nodes'
+        embed = discord.Embed(
+            title="Message Received",
+            description=packet['decoded'].get('text', ''),
+            color=COLOR
+        )
+        embed.add_field(name="From Node", value=f"{from_long} ({packet['fromId']})", inline=True)
+        if packet['toId'] == '^all':
+            embed.add_field(name="To Channel", value=channel_name, inline=True)
+        else:
+            embed.add_field(name="To Node", value=f"{to_long} ({packet['toId']})", inline=True)
+        embed.set_footer(text=datetime.now().strftime('%d %B %Y %I:%M:%S %p'))
 
-            embed = discord.Embed(title="Message Received", description=packet['decoded']['text'], color=0x67ea94)
-            embed.add_field(name="From Node", value=f"{from_long_name} ({packet['fromId']})", inline=True)
-            embed.set_footer(text=f"{current_time}")
+        meshtodiscord.put(embed)
 
-            if packet['toId'] == '^all':
-                embed.add_field(name="To Channel", value=channel_name, inline=True)
-            else:
-                embed.add_field(name="To Node", value=f"{to_long_name} ({packet['toId']})", inline=True)
+    except Exception as e:
+        logging.warning(f"Error in onReceiveMesh: {e}")
 
-            meshtodiscord.put(embed)
-
-    except KeyError as e:  # Catch empty packet.
-        pass
-    except Exception as e:  # Catch any other exceptions.
-        print(f"Unexpected error: {e}") # For debugging.
-        pass
-
+# ---------------- MeshBot ----------------
 class MeshBot(discord.Client):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.tree = app_commands.CommandTree(self)
-        self.iface = None  # Initialize iface as None.
+        self.iface = None
 
-    async def setup_hook(self) -> None:  # Create the background task and run it in the background.
+    async def setup_hook(self):
         self.bg_task = self.loop.create_task(self.background_task())
         await self.tree.sync()
 
     async def on_ready(self):
-        print(f'Logged in as {self.user} (ID: {self.user.id})')
+        logging.info(f"Logged in as {self.user} (ID: {self.user.id})")
 
     async def background_task(self):
         await self.wait_until_ready()
         counter = 0
-        nodelist = []
-        channel = self.get_channel(channel_id)
+        nodelist_chunks = []
+        public_channel = self.get_channel(CHANNEL_ID)
+
         pub.subscribe(onReceiveMesh, "meshtastic.receive")
         pub.subscribe(onConnectionMesh, "meshtastic.connection.established")
-        try:
-            self.iface = meshtastic.serial_interface.SerialInterface()
-        except Exception as ex:
-            print(f"Error: Could not connect {ex}")
-            sys.exit(1)
+
         while not self.is_closed():
+            if self.iface is None:
+                try:
+                    def connect_iface():
+                        try:
+                            return meshtastic.serial_interface.SerialInterface(MESHTASTIC_PORT)
+                        except SystemExit:
+                            logging.error(f"Meshtastic failed to open {MESHTASTIC_PORT}")
+                            return None
+                    self.iface = await asyncio.get_running_loop().run_in_executor(None, connect_iface)
+                    if self.iface:
+                        logging.info("Connected to Meshtastic interface")
+                    else:
+                        await asyncio.sleep(5)
+                        continue
+                except Exception as e:
+                    logging.error(f"Error connecting to Meshtastic: {e}")
+                    await asyncio.sleep(5)
+                    continue
+
             counter += 1
-            if (counter % 12 == 1):  # Approximately 1 minute (every 12th call, call every 5 seconds) to refresh the node list.
-                nodelist = ["**Nodes seen in the last 15 minutes:**\n"]
+            if counter % 12 == 1:
+                nodelist = ["**Nodes seen in last 15 minutes:**\n"]
                 nodes = self.iface.nodes
                 for node in nodes:
                     try:
-                        id = str(nodes[node]['user']['id'])
-                        longname = str(nodes[node]['user']['longName'])
-                        if "hopsAway" in nodes[node]:
-                            hopsaway = str(nodes[node]['hopsAway'])
-                        else:
-                            hopsaway = "0"
-                        if "snr" in nodes[node]:
-                            snr = str(nodes[node]['snr'])
-                        else:
-                            snr = "?"
-                        if "lastHeard" in nodes[node]:
-                            ts = int(nodes[node]['lastHeard'])
-                            timezone = pytz.timezone(time_zone)
-                            local_time = datetime.fromtimestamp(ts, tz=pytz.utc).astimezone(timezone)
-                            timestr = local_time.strftime('%d %B %Y %I:%M:%S %p')
-                        else:
-                            # 15 minute timer for active nodes.
-                            ts = time.time() - (16 * 60)
-                            timestr = "Unknown"
-                        if ts > time.time() - (15 * 60):
-                            nodelist.append(f"\n**ID:** {id} | **Long Name:** {longname} | **Hops:** {hopsaway} | **SNR:** {snr} | **Last Heard:** {timestr}")
-                    except KeyError as e:
-                        print(e)
+                        user = nodes[node].get('user', {})
+                        last_heard = nodes[node].get('lastHeard', 0)
+                        if time.time() - last_heard <= 15 * 60:
+                            last_heard_str = datetime.fromtimestamp(last_heard, pytz.timezone(TIME_ZONE)).strftime('%d %B %Y %I:%M:%S %p') if last_heard else "Unknown"
+                            nodelist.append(
+                                f"**ID:** {user.get('id', node)} | **Name:** {user.get('longName', 'Unknown')} | "
+                                f"**Hops:** {nodes[node].get('hopsAway', 0)} | "
+                                f"**SNR:** {nodes[node].get('snr', '?')} | "
+                                f"**Last Heard:** {last_heard_str}"
+                            )
+                    except Exception:
                         pass
+                nodelist_chunks = ["\n".join(nodelist[i:i+10]) for i in range(0, len(nodelist), 10)]
 
-                # Split node list into chunks of 10 rows.
-                nodelist_chunks = ["".join(nodelist[i:i + 10]) for i in range(0, len(nodelist), 10)]
-
+            # Process mesh -> Discord
             try:
-                meshmessage = meshtodiscord.get_nowait()
-                if isinstance(meshmessage, discord.Embed):
-                    await channel.send(embed=meshmessage)
-                else:
-                    await channel.send(meshmessage)
+                embed = meshtodiscord.get_nowait()
+                if isinstance(embed, discord.Embed) and public_channel:
+                    await public_channel.send(embed=embed)
                 meshtodiscord.task_done()
             except queue.Empty:
                 pass
+
+            # Process Discord -> mesh
             try:
-                meshmessage = discordtomesh.get_nowait()
-                if meshmessage.startswith('channel='):
-                    channel_index = int(meshmessage[8:meshmessage.find(' ')])
-                    message = meshmessage[meshmessage.find(' ') + 1:]
-                    self.iface.sendText(message, channelIndex=channel_index)
-                elif meshmessage.startswith('nodenum='):
-                    nodenum = int(meshmessage[8:meshmessage.find(' ')])
-                    self.iface.sendText(meshmessage[meshmessage.find(' ') + 1:], destinationId=nodenum)
+                msg = discordtomesh.get_nowait()
+                if msg.startswith("channel="):
+                    idx = int(msg[8:msg.find(" ")])
+                    text = msg[msg.find(" ") + 1:]
+                    def send_channel(): return self.iface.sendText(text, channelIndex=idx)
+                    await asyncio.get_running_loop().run_in_executor(None, send_channel)
+                elif msg.startswith("nodenum="):
+                    node_id = int(msg[8:msg.find(" ")])
+                    text = msg[msg.find(" ") + 1:]
+                    def send_node(): return self.iface.sendText(text, destinationId=node_id)
+                    await asyncio.get_running_loop().run_in_executor(None, send_node)
                 else:
-                    self.iface.sendText(meshmessage)
+                    def send_all(): return self.iface.sendText(msg, destinationId='^all')
+                    await asyncio.get_running_loop().run_in_executor(None, send_all)
                 discordtomesh.task_done()
-            except:
+            except queue.Empty:
                 pass
+
+            # Process ephemeral node list requests
             try:
-                nodelistq.get_nowait()
-                # Sends node list if there are any.
+                interaction = nodelistq.get_nowait()
                 for chunk in nodelist_chunks:
-                    await channel.send(chunk)
+                    await interaction.followup.send(chunk, ephemeral=True)
                 nodelistq.task_done()
             except queue.Empty:
                 pass
+
             await asyncio.sleep(5)
 
+# ---------------- Help View ----------------
 class HelpView(View):
     def __init__(self):
         super().__init__(timeout=None)
-
-        # Create buttons
         self.add_item(Button(label="Kavitate", style=ButtonStyle.link, url="https://github.com/Kavitate"))
-        self.add_item(Button(label="Mehtastic", style=ButtonStyle.link, url="https://meshtastic.org"))
+        self.add_item(Button(label="Meshtastic", style=ButtonStyle.link, url="https://meshtastic.org"))
         self.add_item(Button(label="Meshmap", style=ButtonStyle.link, url="https://meshmap.net"))
 
-client = MeshBot(intents=discord.Intents.default())
+# ---------------- Bot Setup ----------------
+intents = discord.Intents.default()
+client = MeshBot(intents=intents)
 
+# ---------- Standard Commands ----------
 @client.tree.command(name="help", description="Shows the help message.")
 async def help_command(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=False)
-
-    # Base help text
+    await interaction.response.defer(ephemeral=True)
     help_text = ("**Command List**\n"
                  "`/sendid` - Send a message to another node.\n"
                  "`/sendnum` - Send a message to another node.\n"
                  "`/active` - Shows all active nodes.\n"
                  "`/help` - Shows this help message.\n")
-
-    # Dynamically add channel commands based on channel_names
-    for channel_index, channel_name in channel_names.items():
-        help_text += f"`/{channel_name.lower()}` - Send a message in the {channel_name} channel.\n"
-
-    color = 0x67ea94
-
-    embed = discord.Embed(title="Meshtastic Bot Help", description=help_text, color=color)
+    for idx, name in CHANNEL_NAMES.items():
+        help_text += f"`/{name.lower()}` - Send a message in the {name} channel.\n"
+    embed = discord.Embed(title="Meshtastic Bot Help", description=help_text, color=COLOR)
     embed.set_footer(text="Meshtastic Discord Bot by Kavitate")
-    ascii_art_image_url = "https://i.imgur.com/qvo2NkW.jpeg"
-    embed.set_image(url=ascii_art_image_url)
+    embed.set_image(url="https://i.imgur.com/qvo2NkW.jpeg")
+    await interaction.followup.send(embed=embed, view=HelpView(), ephemeral=True)
 
-    view = HelpView()
-    await interaction.followup.send(embed=embed, view=view)
-
-@client.tree.command(name="sendid", description="Send a message to a specific node.")
+@client.tree.command(name="sendid", description="Send a message to a specific node (hex ID).")
 async def sendid(interaction: discord.Interaction, nodeid: str, message: str):
     try:
-        # Strip the leading '!' if present
-        if nodeid.startswith('!'):
+        if nodeid.startswith("!"):
             nodeid = nodeid[1:]
-
-        # Convert hexadecimal node ID to decimal
         nodenum = int(nodeid, 16)
-
-        current_time = datetime.now().strftime('%d %B %Y %I:%M:%S %p')
-
-        embed = discord.Embed(title="Sending Message", description=message, color=0x67ea94)
-        embed.add_field(name="To Node:", value=f"!{nodeid}", inline=True)  # Add '!' in front of nodeid
-        embed.set_footer(text=f"{current_time}")
-        await interaction.response.send_message(embed=embed, ephemeral=False)
         discordtomesh.put(f"nodenum={nodenum} {message}")
+        await interaction.response.send_message(f"Sending to node !{nodeid}: {message}", ephemeral=True)
     except ValueError:
-        error_embed = discord.Embed(title="Error", description="Invalid hexadecimal node ID.", color=0x67ea94)
-        await interaction.response.send_message(embed=error_embed, ephemeral=True)
+        await interaction.response.send_message("Invalid hexadecimal node ID.", ephemeral=True)
 
-@client.tree.command(name="sendnum", description="Send a message to a specific node.")
+@client.tree.command(name="sendnum", description="Send a message to a specific node (decimal ID).")
 async def sendnum(interaction: discord.Interaction, nodenum: int, message: str):
-    current_time = datetime.now().strftime('%d %B %Y %I:%M:%S %p')
-
-    embed = discord.Embed(title="Sending Message", description=message, color=0x67ea94)
-    embed.add_field(name="To Node:", value=str(nodenum), inline=True)
-    embed.set_footer(text=f"{current_time}")
-    await interaction.response.send_message(embed=embed)
     discordtomesh.put(f"nodenum={nodenum} {message}")
+    await interaction.response.send_message(f"Sending to node {nodenum}: {message}", ephemeral=True)
 
-# Dynamically create commands based on channel_names
-for channel_index, channel_name in channel_names.items():
-    @client.tree.command(name=channel_name.lower(), description=f"Send a message in the {channel_name} channel.")
-    async def send_channel_message(interaction: discord.Interaction, message: str, channel_index: int = channel_index):
-        current_time = datetime.now().strftime('%d %B %Y %I:%M:%S %p')
-        embed = discord.Embed(title=f"Sending Message to {channel_names[channel_index]}:", description=message, color=0x67ea94)
-        embed.set_footer(text=f"{current_time}")
-        await interaction.response.send_message(embed=embed)
+# ---------- Dynamic Channel Commands (Public) ----------
+def create_channel_command(channel_index: int, channel_name: str):
+    @client.tree.command(
+        name=channel_name.lower(),
+        description=f"Send a message to the {channel_name} channel."
+    )
+    async def send_channel(interaction: discord.Interaction, message: str):
         discordtomesh.put(f"channel={channel_index} {message}")
+        channel = client.get_channel(CHANNEL_ID)
+        if channel:
+            embed = discord.Embed(
+                title=f"Message to {CHANNEL_NAMES[channel_index]}",
+                description=message,
+                color=COLOR
+            )
+            embed.set_footer(text=datetime.now().strftime('%d %B %Y %I:%M:%S %p'))
+            await channel.send(embed=embed)
+        await interaction.response.send_message(f"Message sent to channel {CHANNEL_NAMES[channel_index]}.", ephemeral=True)
+    return send_channel
 
-@client.tree.command(name="active", description="Lists all active nodes.")
+for idx, name in CHANNEL_NAMES.items():
+    create_channel_command(idx, name)
+
+# ---------- Active Nodes Command (Ephemeral) ----------
+@client.tree.command(name="active", description="Shows active nodes.")
 async def active(interaction: discord.Interaction):
-    await interaction.response.defer()
-
-    nodelistq.put(True)
-
+    await interaction.response.defer(ephemeral=True)
+    nodelistq.put(interaction)
     await asyncio.sleep(1)
-
     await interaction.delete_original_response()
 
-def run_discord_bot():
+# ---------- WXNOW Command (Line-by-Line with 3s pause) ----------
+@client.tree.command(name="wxnow", description="Shows the current weather report from wxnow file.")
+async def wxnow_command(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=False)
+    logging.info("Executing /wxnow command...")
+
+    if not WX_FILE or not os.path.exists(WX_FILE):
+        logging.warning("WXnow file not found or not configured.")
+        await interaction.followup.send("Weather file not found or not configured.", ephemeral=False)
+        return
+
     try:
-        client.run(token)
+        with open(WX_FILE, "r") as f:
+            lines = f.read().splitlines()
+        logging.info(f"WXnow file read successfully, {len(lines)} lines found.")
+
+        if len(lines) < 2:
+            report_lines = ["No weather report available."]
+        else:
+            date_line = lines[0].strip()
+            data_line = lines[1].strip()
+
+            # Decode WXNOW values by prefix
+            wind_dir = int(data_line[0:3])
+            wind_speed = int(data_line[4:7])
+            wind_gust = int(data_line[data_line.find('g')+1:data_line.find('g')+4])
+            temp = int(data_line[data_line.find('t')+1:data_line.find('t')+4])
+            rain_hour = int(data_line[data_line.find('r')+1:data_line.find('r')+3])/100.0
+            rain_24h = int(data_line[data_line.find('p')+1:data_line.find('p')+3])/100.0
+            rain_since_midnight = int(data_line[data_line.find('P')+1:data_line.find('P')+3])/100.0
+            humidity_raw = int(data_line[data_line.find('h')+1:data_line.find('h')+3])
+            humidity = 100 if humidity_raw == 0 else humidity_raw
+            baro_raw = int(data_line[data_line.find('b')+1:data_line.find('b')+5])
+            baro = baro_raw / 10.0
+
+            report_lines = [
+                f"Flint Hill Weather Report:",
+                f"Date/Time: {date_line}",
+                f"Wind: {wind_dir}° at {wind_speed} mph (Gust {wind_gust} mph)",
+                f"Temp: {temp}°F",
+                f"Rain last hour: {rain_hour} in",
+                f"Rain last 24h: {rain_24h} in",
+                f"Rain since midnight: {rain_since_midnight} in",
+                f"Humidity: {humidity}%",
+                f"Pressure: {baro} mb"
+            ]
+
+        # Send to Discord
+        discord_report = "\n".join(report_lines)
+        embed = discord.Embed(
+            title="Flint Hill Weather Report",
+            description=discord_report,
+            color=COLOR
+        )
+        embed.set_footer(text=datetime.now(pytz.timezone(TIME_ZONE)).strftime('%d %B %Y %I:%M:%S %p'))
+        await interaction.followup.send(embed=embed, ephemeral=False)
+        logging.info("Sent weather report to Discord.")
+
+        # Send to Meshtastic line by line on channel 0
+        if not client.iface or not hasattr(client.iface, "myInfo") or not client.iface.myInfo:
+            logging.warning("Meshtastic interface not ready. Skipping mesh sending.")
+            return
+
+        logging.info("Sending weather report to Meshtastic (line by line)...")
+
+        def send_lines():
+            for line in report_lines:
+                client.iface.sendText(line, destinationId="^all", channelIndex=0)
+                logging.info(f"Sent Meshtastic line ({len(line)} chars): {line}")
+                time.sleep(3)  # 3-second pause between lines
+
+        await asyncio.get_running_loop().run_in_executor(None, send_lines)
+        logging.info("All Meshtastic lines sent successfully.")
+
     except Exception as e:
-        logging.error(f"An error occurred while running the bot: {e}")
+        logging.error(f"Error reading WXnow file or sending messages: {e}", exc_info=True)
+        await interaction.followup.send(f"Error reading weather file: {e}", ephemeral=False)
+
+
+# ---------------- Run Bot ----------------
+def run_bot():
+    try:
+        client.run(TOKEN)
+    except Exception as e:
+        logging.error(f"Bot crashed: {e}")
     finally:
-        if client:
-            asyncio.run(client.close())
+        asyncio.run(client.close())
 
 if __name__ == "__main__":
-    run_discord_bot()
+    logging.basicConfig(level=logging.INFO)
+    run_bot()
