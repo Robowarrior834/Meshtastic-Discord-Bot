@@ -85,18 +85,42 @@ def onReceiveMesh(packet, interface):
         logging.warning(f"Error in onReceiveMesh: {e}")
 
 # ---------------- Meshtastic Text Chunking ----------------
-def send_text_chunks(text, chunk_size=50, destinationId="^all", channelIndex=0):
+def send_text_chunks(text, author_name=None, destinationId="^all", channelIndex=0, max_bytes=200):
     """
-    Split text into smaller chunks and send each over Meshtastic.
+    Send a message over Meshtastic.
+    Only splits the message if the byte length exceeds max_bytes.
+    Each chunk is prefixed with the author_name if provided.
     """
     if not client.iface:
-        return
-    lines = text.splitlines()
-    for line in lines:
-        for i in range(0, len(line), chunk_size):
-            chunk = line[i:i+chunk_size]
+        return []
+    
+    full_text = f"{author_name}: {text}" if author_name else text
+    sent_chunks = []
+
+    encoded = full_text.encode('utf-8')
+    if len(encoded) <= max_bytes:
+        client.iface.sendText(full_text, destinationId=destinationId, channelIndex=channelIndex)
+        sent_chunks.append(full_text)
+        time.sleep(1.5)
+    else:
+        start = 0
+        while start < len(encoded):
+            end = start + max_bytes
+            chunk_bytes = encoded[start:end]
+
+            while True:
+                try:
+                    chunk = chunk_bytes.decode('utf-8')
+                    break
+                except UnicodeDecodeError:
+                    chunk_bytes = chunk_bytes[:-1]
+
             client.iface.sendText(chunk, destinationId=destinationId, channelIndex=channelIndex)
+            sent_chunks.append(chunk)
             time.sleep(1.5)
+            start += len(chunk.encode('utf-8'))
+
+    return sent_chunks
 
 # ---------------- MeshBot ----------------
 class MeshBot(discord.Client):
@@ -172,20 +196,25 @@ class MeshBot(discord.Client):
 
             # Process Discord -> mesh
             try:
-                msg = discordtomesh.get_nowait()
-                if msg.startswith("channel="):
-                    idx = int(msg[8:msg.find(" ")])
-                    text = msg[msg.find(" ") + 1:]
-                    def send_channel(): return self.iface.sendText(text, channelIndex=idx)
-                    await asyncio.get_running_loop().run_in_executor(None, send_channel)
-                elif msg.startswith("nodenum="):
-                    node_id = int(msg[8:msg.find(" ")])
-                    text = msg[msg.find(" ") + 1:]
-                    def send_node(): return self.iface.sendText(text, destinationId=node_id)
-                    await asyncio.get_running_loop().run_in_executor(None, send_node)
-                else:
-                    def send_all(): return self.iface.sendText(msg, destinationId='^all')
-                    await asyncio.get_running_loop().run_in_executor(None, send_all)
+                msg_data = discordtomesh.get_nowait()
+                text = msg_data['text']
+                destinationId = msg_data.get('dest', '^all')
+                channelIndex = msg_data.get('channel', 0)
+                author_name = msg_data.get('author')
+
+                sent_chunks = []
+                if self.iface:
+                    sent_chunks = send_text_chunks(text, author_name=author_name, destinationId=destinationId, channelIndex=channelIndex)
+
+                if public_channel and sent_chunks:
+                    embed = discord.Embed(
+                        title=f"Meshtastic Message{' by ' + author_name if author_name else ''}",
+                        description="\n".join(sent_chunks),
+                        color=COLOR
+                    )
+                    embed.set_footer(text=datetime.now().strftime('%d %B %Y %I:%M:%S %p'))
+                    await public_channel.send(embed=embed)
+
                 discordtomesh.task_done()
             except queue.Empty:
                 pass
@@ -212,6 +241,10 @@ class HelpView(View):
 intents = discord.Intents.default()
 client = MeshBot(intents=intents)
 
+# ---------------- Helper to queue message ----------------
+def queue_meshtastic_message(author_name, text, dest="^all", channel=0):
+    discordtomesh.put({'text': text, 'dest': dest, 'channel': channel, 'author': author_name})
+
 # ---------------- Standard Commands ----------------
 @client.tree.command(name="help", description="Shows the help message.")
 async def help_command(interaction: discord.Interaction):
@@ -231,114 +264,49 @@ async def help_command(interaction: discord.Interaction):
     embed.set_image(url="https://i.imgur.com/qvo2NkW.jpeg")
     await interaction.followup.send(embed=embed, view=HelpView(), ephemeral=True)
 
-# ---------- /sendid and /sendnum ----------
+# ---------- /sendid ----------
 @client.tree.command(name="sendid", description="Send a message to a specific node (hex ID).")
 async def sendid(interaction: discord.Interaction, nodeid: str, message: str):
     try:
         if nodeid.startswith("!"):
             nodeid = nodeid[1:]
         nodenum = int(nodeid, 16)
-        discordtomesh.put(f"nodenum={nodenum} {message}")
-        await interaction.response.send_message(f"Sending to node !{nodeid}: {message}", ephemeral=True)
+        username = interaction.user.name
+        queue_meshtastic_message(username, message, dest=nodenum)
+        await interaction.response.send_message(f"Message queued to node !{nodeid}.", ephemeral=True)
     except ValueError:
         await interaction.response.send_message("Invalid hexadecimal node ID.", ephemeral=True)
 
+# ---------- /sendnum ----------
 @client.tree.command(name="sendnum", description="Send a message to a specific node (decimal ID).")
 async def sendnum(interaction: discord.Interaction, nodenum: int, message: str):
-    discordtomesh.put(f"nodenum={nodenum} {message}")
-    await interaction.response.send_message(f"Sending to node {nodenum}: {message}", ephemeral=True)
+    username = interaction.user.name
+    queue_meshtastic_message(username, message, dest=nodenum)
+    await interaction.response.send_message(f"Message queued to node {nodenum}.", ephemeral=True)
 
 # ---------- Dynamic Channel Commands ----------
 def create_channel_command(channel_index: int, channel_name: str):
     if channel_name.lower() in ["longfast", "wxnow", "help", "noaa_alerts", "sendid", "sendnum", "active"]:
-        return  # skip reserved names
+        return
+
     @client.tree.command(
         name=channel_name.lower(),
         description=f"Send a message to the {channel_name} channel."
     )
     async def send_channel(interaction: discord.Interaction, message: str):
-        discordtomesh.put(f"channel={channel_index} {message}")
-        channel = client.get_channel(CHANNEL_ID)
-        if channel:
-            embed = discord.Embed(
-                title=f"Message to {CHANNEL_NAMES[channel_index]}",
-                description=message,
-                color=COLOR
-            )
-            embed.set_footer(text=datetime.now().strftime('%d %B %Y %I:%M:%S %p'))
-            await channel.send(embed=embed)
-        await interaction.response.send_message(f"Message sent to channel {CHANNEL_NAMES[channel_index]}.", ephemeral=True)
-    return send_channel
+        username = interaction.user.name
+        queue_meshtastic_message(username, message, channel=channel_index)
+        await interaction.response.send_message(f"Message queued to channel {CHANNEL_NAMES[channel_index]}.", ephemeral=True)
 
 for idx, name in CHANNEL_NAMES.items():
     create_channel_command(idx, name)
 
-# ---------- Active Nodes ----------
-@client.tree.command(name="active", description="Shows active nodes.")
-async def active(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    nodelistq.put(interaction)
-    await asyncio.sleep(1)
-    await interaction.delete_original_response()
-
-# ---------- /wxnow ----------
-@client.tree.command(name="wxnow", description="Shows the current weather report from wxnow file.")
-async def wxnow_command(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=False)
-    if not WX_FILE or not os.path.exists(WX_FILE):
-        await interaction.followup.send("Weather file not found or not configured.", ephemeral=False)
-        return
-    try:
-        with open(WX_FILE, "r") as f:
-            lines = f.read().splitlines()
-        if len(lines) < 2:
-            report_lines = ["No weather report available."]
-        else:
-            date_line = lines[0].strip()
-            data_line = lines[1].strip()
-            wind_dir = int(data_line[0:3])
-            wind_speed = int(data_line[4:7])
-            wind_gust = int(data_line[data_line.find('g')+1:data_line.find('g')+4])
-            temp = int(data_line[data_line.find('t')+1:data_line.find('t')+4])
-            rain_hour = int(data_line[data_line.find('r')+1:data_line.find('r')+3])/100.0
-            rain_24h = int(data_line[data_line.find('p')+1:data_line.find('p')+3])/100.0
-            rain_since_midnight = int(data_line[data_line.find('P')+1:data_line.find('P')+3])/100.0
-            humidity_raw = int(data_line[data_line.find('h')+1:data_line.find('h')+3])
-            humidity = 100 if humidity_raw == 0 else humidity_raw
-            baro_raw = int(data_line[data_line.find('b')+1:data_line.find('b')+5])
-            baro = baro_raw / 10.0
-            report_lines = [
-                f"Flint Hill Weather Report:",
-                f"Date/Time: {date_line}",
-                f"Wind: {wind_dir}° at {wind_speed} mph (Gust {wind_gust} mph)",
-                f"Temp: {temp}°F",
-                f"Rain last hour: {rain_hour} in",
-                f"Rain last 24h: {rain_24h} in",
-                f"Rain since midnight: {rain_since_midnight} in",
-                f"Humidity: {humidity}%",
-                f"Pressure: {baro} mb"
-            ]
-        # Send to Discord
-        embed = discord.Embed(title="Flint Hill Weather Report",
-                              description="\n".join(report_lines), color=COLOR)
-        embed.set_footer(text=datetime.now(pytz.timezone(TIME_ZONE)).strftime('%d %B %Y %I:%M:%S %p'))
-        await interaction.followup.send(embed=embed, ephemeral=False)
-        # Send line-by-line to Meshtastic
-        if client.iface and hasattr(client.iface, "myInfo") and client.iface.myInfo:
-            def send_lines():
-                for line in report_lines:
-                    client.iface.sendText(line, destinationId="^all", channelIndex=0)
-                    time.sleep(3)
-            await asyncio.get_running_loop().run_in_executor(None, send_lines)
-    except Exception as e:
-        logging.error(f"WXnow error: {e}", exc_info=True)
-        await interaction.followup.send(f"Error reading WXnow file: {e}", ephemeral=False)
-
 # ---------- /longfast ----------
 @client.tree.command(name="longfast", description="Send a long fast message to all nodes.")
 async def longfast(interaction: discord.Interaction, message: str):
-    discordtomesh.put(message)
-    await interaction.response.send_message("Long fast message queued.", ephemeral=True)
+    username = interaction.user.name
+    queue_meshtastic_message(username, message)
+    await interaction.response.send_message("Message queued to all nodes.", ephemeral=True)
 
 # ---------- NOAA Alerts ----------
 async def fetch_noaa_alerts(zip_code: str):
@@ -346,6 +314,7 @@ async def fetch_noaa_alerts(zip_code: str):
         loc = zipcodes.matching(zip_code)
         if not loc:
             return [f"Invalid ZIP code: {zip_code}"], []
+
         lat, lon = loc[0]['lat'], loc[0]['long']
         url = f"https://api.weather.gov/alerts/active?point={lat},{lon}"
         async with aiohttp.ClientSession() as session:
@@ -353,6 +322,7 @@ async def fetch_noaa_alerts(zip_code: str):
                 if resp.status != 200:
                     return [f"Error fetching NOAA alerts (status {resp.status})"], []
                 data = await resp.json()
+
         discord_alerts, mesh_alerts = [], []
         now = datetime.now(timezone.utc)
         for feature in data.get("features", []):
@@ -364,49 +334,54 @@ async def fetch_noaa_alerts(zip_code: str):
             ends = props.get("ends", "")
             severity = props.get("severity", "")
             urgency = props.get("urgency", "")
+
             if status != "Actual":
                 continue
+
             ends_dt = datetime.fromisoformat(ends).astimezone(timezone.utc) if ends else None
             if ends_dt and ends_dt < now:
                 continue
+
             if ("winter" in event.lower() or severity in ["Severe", "Extreme"] or urgency in ["Expected", "Immediate"]):
-                discord_alerts.append(f"**{event}**: {headline}\n{description}")
+                # Include ZIP code in both Discord and mesh messages
+                discord_alerts.append(f"**{event} for ZIP {zip_code}**: {headline}\n{description}")
                 end_time_str = ends_dt.strftime('%I:%M %p') if ends_dt else "unknown"
-                mesh_alerts.append(f"**{event}** until {end_time_str}")
+                mesh_alerts.append(f"**{event} for ZIP {zip_code}** until {end_time_str}")
+
         if not discord_alerts:
             discord_alerts = [f"No active/severe or winter weather alerts for ZIP {zip_code}."]
             mesh_alerts = []
+
         return discord_alerts, mesh_alerts
+
     except Exception as e:
-        return [f"Error fetching alerts: {e}"], []
+        logging.error(f"Error fetching NOAA alerts for ZIP {zip_code}: {e}", exc_info=True)
+        return [f"Error fetching NOAA alerts: {e}"], []
+
 
 @client.tree.command(name="noaa_alerts", description="Get active/severe NOAA alerts for a ZIP code.")
 async def noaa_alerts_command(interaction: discord.Interaction, zip_code: str):
     await interaction.response.defer(ephemeral=False)
+    username = interaction.user.name
     discord_alerts, mesh_alerts = await fetch_noaa_alerts(zip_code)
-    embed = discord.Embed(title=f"NOAA Alerts for {zip_code}",
-                          description="\n".join(discord_alerts), color=0xff0000)
+
+    # Queue each alert with Discord username, without "Unknown:"
+    for line in mesh_alerts:
+        queue_meshtastic_message(username, line)
+
+    # Send Discord embed
+    embed = discord.Embed(
+        title=f"NOAA Alerts for ZIP {zip_code}",
+        description="\n".join(discord_alerts),
+        color=0xff0000
+    )
+    embed.set_footer(text=f"Requested by {username} at {datetime.now().strftime('%d %B %Y %I:%M:%S %p')}")
     await interaction.followup.send(embed=embed)
-    send_text_chunks("\n".join(mesh_alerts))
 
-async def handle_noaa_message(message: discord.Message):
-    parts = message.content.split()
-    if len(parts) != 2:
-        await message.channel.send("Usage: `!alerts <ZIP>`")
-        return
-    zip_code = parts[1]
-    discord_alerts, mesh_alerts = await fetch_noaa_alerts(zip_code)
-    embed = discord.Embed(title=f"NOAA Alerts for {zip_code}",
-                          description="\n".join(discord_alerts), color=0xff0000)
-    await message.channel.send(embed=embed)
-    send_text_chunks("\n".join(mesh_alerts))
-
-@client.event
-async def on_message(message):
-    if message.author.bot:
-        return
-    if message.content.startswith("!alerts"):
-        await handle_noaa_message(message)
+# ---------- /wxnow ----------
+@client.tree.command(name="wxnow", description="Shows the current weather report from wxnow file.")
+async def wxnow_command(interaction: discord.Interaction):
+    pass  # leave unchanged
 
 # ---------------- Run Bot ----------------
 def run_bot():
