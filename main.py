@@ -4,15 +4,17 @@ import logging
 import queue
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 import os
 import discord
-from discord import app_commands, ButtonStyle
+from discord import app_commands, ButtonStyle, Embed
 from discord.ui import View, Button
 import meshtastic
 import meshtastic.serial_interface
 import pytz
 from pubsub import pub
+import aiohttp
+import zipcodes  # pip install zipcodes
 
 # ---------------- Config ----------------
 def load_config():
@@ -65,7 +67,7 @@ def onReceiveMesh(packet, interface):
         from_long = get_long_name(packet['fromId'], nodes)
         to_long = 'All Nodes' if packet['toId'] == '^all' else get_long_name(packet['toId'], nodes)
 
-        embed = discord.Embed(
+        embed = Embed(
             title="Message Received",
             description=packet['decoded'].get('text', ''),
             color=COLOR
@@ -82,7 +84,7 @@ def onReceiveMesh(packet, interface):
     except Exception as e:
         logging.warning(f"Error in onReceiveMesh: {e}")
 
-# ---------------- MeshBot ----------------
+# ---------------- Bot Class ----------------
 class MeshBot(discord.Client):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -106,6 +108,7 @@ class MeshBot(discord.Client):
         pub.subscribe(onConnectionMesh, "meshtastic.connection.established")
 
         while not self.is_closed():
+            # Connect to Meshtastic interface
             if self.iface is None:
                 try:
                     def connect_iface():
@@ -127,6 +130,7 @@ class MeshBot(discord.Client):
 
             counter += 1
             if counter % 12 == 1:
+                # Build active node list
                 nodelist = ["**Nodes seen in last 15 minutes:**\n"]
                 nodes = self.iface.nodes
                 for node in nodes:
@@ -189,7 +193,7 @@ class MeshBot(discord.Client):
 class HelpView(View):
     def __init__(self):
         super().__init__(timeout=None)
-        self.add_item(Button(label="Kavitate", style=ButtonStyle.link, url="https://github.com/Robowarrior834/Meshtastic-Discord-Bot/tree/main"))
+        self.add_item(Button(label="Robowarrior", style=ButtonStyle.link, url="https://github.com/Robowarrior834/Meshtastic-Discord-Bot/tree/main"))
         self.add_item(Button(label="Meshtastic", style=ButtonStyle.link, url="https://meshtastic.org"))
 
 # ---------------- Bot Setup ----------------
@@ -207,7 +211,7 @@ async def help_command(interaction: discord.Interaction):
                  "`/help` - Shows this help message.\n")
     for idx, name in CHANNEL_NAMES.items():
         help_text += f"`/{name.lower()}` - Send a message in the {name} channel.\n"
-    embed = discord.Embed(title="Meshtastic Bot Help", description=help_text, color=COLOR)
+    embed = Embed(title="Meshtastic Bot Help", description=help_text, color=COLOR)
     embed.set_footer(text="Meshtastic Discord Bot by Kavitate")
     embed.set_image(url="https://i.imgur.com/qvo2NkW.jpeg")
     await interaction.followup.send(embed=embed, view=HelpView(), ephemeral=True)
@@ -238,7 +242,7 @@ def create_channel_command(channel_index: int, channel_name: str):
         discordtomesh.put(f"channel={channel_index} {message}")
         channel = client.get_channel(CHANNEL_ID)
         if channel:
-            embed = discord.Embed(
+            embed = Embed(
                 title=f"Message to {CHANNEL_NAMES[channel_index]}",
                 description=message,
                 color=COLOR
@@ -259,29 +263,22 @@ async def active(interaction: discord.Interaction):
     await asyncio.sleep(1)
     await interaction.delete_original_response()
 
-# ---------- WXNOW Command (Line-by-Line with 3s pause) ----------
+# ---------- WXNOW COMMAND ----------------
 @client.tree.command(name="wxnow", description="Shows the current weather report from wxnow file.")
 async def wxnow_command(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=False)
-    logging.info("Executing /wxnow command...")
-
     if not WX_FILE or not os.path.exists(WX_FILE):
-        logging.warning("WXnow file not found or not configured.")
         await interaction.followup.send("Weather file not found or not configured.", ephemeral=False)
         return
-
     try:
         with open(WX_FILE, "r") as f:
             lines = f.read().splitlines()
-        logging.info(f"WXnow file read successfully, {len(lines)} lines found.")
 
         if len(lines) < 2:
             report_lines = ["No weather report available."]
         else:
             date_line = lines[0].strip()
             data_line = lines[1].strip()
-
-            # Decode WXNOW values by prefix
             wind_dir = int(data_line[0:3])
             wind_speed = int(data_line[4:7])
             wind_gust = int(data_line[data_line.find('g')+1:data_line.find('g')+4])
@@ -306,37 +303,121 @@ async def wxnow_command(interaction: discord.Interaction):
                 f"Pressure: {baro} mb"
             ]
 
-        # Send to Discord
-        discord_report = "\n".join(report_lines)
-        embed = discord.Embed(
+        embed = Embed(
             title="Flint Hill Weather Report",
-            description=discord_report,
+            description="\n".join(report_lines),
             color=COLOR
         )
         embed.set_footer(text=datetime.now(pytz.timezone(TIME_ZONE)).strftime('%d %B %Y %I:%M:%S %p'))
         await interaction.followup.send(embed=embed, ephemeral=False)
-        logging.info("Sent weather report to Discord.")
 
-        # Send to Meshtastic line by line on channel 0
-        if not client.iface or not hasattr(client.iface, "myInfo") or not client.iface.myInfo:
-            logging.warning("Meshtastic interface not ready. Skipping mesh sending.")
-            return
-
-        logging.info("Sending weather report to Meshtastic (line by line)...")
-
-        def send_lines():
-            for line in report_lines:
-                client.iface.sendText(line, destinationId="^all", channelIndex=0)
-                logging.info(f"Sent Meshtastic line ({len(line)} chars): {line}")
-                time.sleep(3)  # 3-second pause between lines
-
-        await asyncio.get_running_loop().run_in_executor(None, send_lines)
-        logging.info("All Meshtastic lines sent successfully.")
+        if client.iface and hasattr(client.iface, "myInfo") and client.iface.myInfo:
+            def send_lines():
+                for line in report_lines:
+                    client.iface.sendText(line, destinationId="^all", channelIndex=0)
+                    time.sleep(1.5)
+            await asyncio.get_running_loop().run_in_executor(None, send_lines)
 
     except Exception as e:
-        logging.error(f"Error reading WXnow file or sending messages: {e}", exc_info=True)
         await interaction.followup.send(f"Error reading weather file: {e}", ephemeral=False)
 
+# ---------- NOAA ALERTS ----------------
+async def fetch_noaa_alerts(zip_code: str):
+    try:
+        loc = zipcodes.matching(zip_code)
+        if not loc:
+            return [f"Invalid ZIP code: {zip_code}"]
+        lat = loc[0]['lat']
+        lon = loc[0]['long']
+        url = f"https://api.weather.gov/alerts/active?point={lat},{lon}"
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    return [f"Error fetching NOAA alerts (status {resp.status})"]
+                data = await resp.json()
+
+        alerts = []
+        now = datetime.now(timezone.utc)
+
+        for feature in data.get("features", []):
+            props = feature.get("properties", {})
+            status = props.get("status", "")
+            event = props.get("event", "")
+            headline = props.get("headline", "")
+            description = props.get("description", "")
+            expires = props.get("expires")
+            severity = props.get("severity", "")
+            urgency = props.get("urgency", "")
+
+            if status != "Actual":
+                continue
+
+            if expires:
+                expires_dt = datetime.fromisoformat(expires).astimezone(timezone.utc)
+                if expires_dt < now:
+                    continue
+
+            if ("winter" in event.lower() or
+                "winter" in headline.lower() or
+                severity in ["Severe", "Extreme"] or
+                urgency in ["Immediate", "Expected"]):
+                alerts.append(f"**{event}**: {headline}\n{description}")
+
+        if not alerts:
+            alerts = [f"No active/severe or winter weather alerts for ZIP {zip_code}."]
+        return alerts
+
+    except Exception as e:
+        return [f"Error fetching alerts: {e}"]
+
+# Slash command
+@client.tree.command(name="noaa_alerts", description="Get active/severe NOAA alerts for a ZIP code.")
+async def noaa_alerts_command(interaction: discord.Interaction, zip_code: str):
+    await interaction.response.defer(ephemeral=False)
+    alerts_lines = await fetch_noaa_alerts(zip_code)
+    embed = Embed(
+        title=f"NOAA Alerts for {zip_code}",
+        description="\n".join(alerts_lines),
+        color=0xff0000
+    )
+    await interaction.followup.send(embed=embed)
+
+    if client.iface and hasattr(client.iface, "myInfo") and client.iface.myInfo:
+        def send_lines():
+            for line in alerts_lines:
+                client.iface.sendText(line, destinationId="^all", channelIndex=0)
+                time.sleep(1.5)
+        await asyncio.get_running_loop().run_in_executor(None, send_lines)
+
+# Message command
+async def handle_noaa_message(message: discord.Message):
+    parts = message.content.split()
+    if len(parts) != 2:
+        await message.channel.send("Usage: `!alerts <ZIP>`")
+        return
+    zip_code = parts[1]
+    alerts_lines = await fetch_noaa_alerts(zip_code)
+    embed = Embed(
+        title=f"NOAA Alerts for {zip_code}",
+        description="\n".join(alerts_lines),
+        color=0xff0000
+    )
+    await message.channel.send(embed=embed)
+
+    if client.iface and hasattr(client.iface, "myInfo") and client.iface.myInfo:
+        def send_lines():
+            for line in alerts_lines:
+                client.iface.sendText(line, destinationId="^all", channelIndex=0)
+                time.sleep(1.5)
+        await asyncio.get_running_loop().run_in_executor(None, send_lines)
+
+@client.event
+async def on_message(message):
+    if message.author.bot:
+        return
+    if message.content.startswith("!alerts"):
+        await handle_noaa_message(message)
 
 # ---------------- Run Bot ----------------
 def run_bot():
