@@ -67,6 +67,9 @@ def onReceiveMesh(packet, interface):
         from_long = get_long_name(packet['fromId'], nodes)
         to_long = 'All Nodes' if packet['toId'] == '^all' else get_long_name(packet['toId'], nodes)
 
+        hops = packet.get('hops', 'N/A')  # Log hops if available
+        logging.info(f"Received message from {from_long} to {to_long}, channel {channel_name}, hops={hops}")
+
         embed = discord.Embed(
             title="Message Received",
             description=packet['decoded'].get('text', ''),
@@ -77,20 +80,16 @@ def onReceiveMesh(packet, interface):
             embed.add_field(name="To Channel", value=channel_name, inline=True)
         else:
             embed.add_field(name="To Node", value=f"{to_long} ({packet['toId']})", inline=True)
+        embed.add_field(name="Hops", value=str(hops), inline=True)
         embed.set_footer(text=datetime.now().strftime('%d %B %Y %I:%M:%S %p'))
 
         meshtodiscord.put(embed)
 
     except Exception as e:
-        logging.warning(f"Error in onReceiveMesh: {e}")
+        logging.warning(f"Error in onReceiveMesh: {e}", exc_info=True)
 
 # ---------------- Meshtastic Text Chunking ----------------
 def send_text_chunks(text, author_name=None, destinationId="^all", channelIndex=0, max_bytes=200):
-    """
-    Send a message over Meshtastic.
-    Only splits the message if the byte length exceeds max_bytes.
-    Each chunk is prefixed with the author_name if provided.
-    """
     if not client.iface:
         return []
     
@@ -244,6 +243,7 @@ client = MeshBot(intents=intents)
 # ---------------- Helper to queue message ----------------
 def queue_meshtastic_message(author_name, text, dest="^all", channel=0):
     discordtomesh.put({'text': text, 'dest': dest, 'channel': channel, 'author': author_name})
+    logging.debug(f"Queued message from {author_name} to Meshtastic: {text}")
 
 # ---------------- Standard Commands ----------------
 @client.tree.command(name="help", description="Shows the help message.")
@@ -252,7 +252,6 @@ async def help_command(interaction: discord.Interaction):
     help_text = ("**Command List**\n"
                  "`/sendid` - Send a message to another node.\n"
                  "`/sendnum` - Send a message to another node.\n"
-                 "`/active` - Shows all active nodes.\n"
                  "`/help` - Shows this help message.\n"
                  "`/wxnow` - Shows current weather.\n"
                  "`/longfast` - Sends a long fast message.\n")
@@ -308,7 +307,7 @@ async def longfast(interaction: discord.Interaction, message: str):
     queue_meshtastic_message(username, message)
     await interaction.response.send_message("Message queued to all nodes.", ephemeral=True)
 
-# ---------- NOAA Alerts ----------
+# ---------- /noaa_alerts ----------
 async def fetch_noaa_alerts(zip_code: str):
     try:
         loc = zipcodes.matching(zip_code)
@@ -343,7 +342,6 @@ async def fetch_noaa_alerts(zip_code: str):
                 continue
 
             if ("winter" in event.lower() or severity in ["Severe", "Extreme"] or urgency in ["Expected", "Immediate"]):
-                # Include ZIP code in both Discord and mesh messages
                 discord_alerts.append(f"**{event} for ZIP {zip_code}**: {headline}\n{description}")
                 end_time_str = ends_dt.strftime('%I:%M %p') if ends_dt else "unknown"
                 mesh_alerts.append(f"**{event} for ZIP {zip_code}** until {end_time_str}")
@@ -358,30 +356,99 @@ async def fetch_noaa_alerts(zip_code: str):
         logging.error(f"Error fetching NOAA alerts for ZIP {zip_code}: {e}", exc_info=True)
         return [f"Error fetching NOAA alerts: {e}"], []
 
-
 @client.tree.command(name="noaa_alerts", description="Get active/severe NOAA alerts for a ZIP code.")
-async def noaa_alerts_command(interaction: discord.Interaction, zip_code: str):
+@app_commands.describe(send_to_mesh="Send NOAA alerts to Meshtastic as well")
+async def noaa_alerts_command(interaction: discord.Interaction, zip_code: str, send_to_mesh: bool = False):
+    logging.info(f"/noaa_alerts command from {interaction.user.name}, zip={zip_code}, send_to_mesh={send_to_mesh}")
     await interaction.response.defer(ephemeral=False)
     username = interaction.user.name
     discord_alerts, mesh_alerts = await fetch_noaa_alerts(zip_code)
 
-    # Queue each alert with Discord username, without "Unknown:"
-    for line in mesh_alerts:
-        queue_meshtastic_message(username, line)
+    if send_to_mesh:
+        for line in mesh_alerts:
+            queue_meshtastic_message(username, line)
 
-    # Send Discord embed
+    footer_text = f"Requested by {username} at {datetime.now().strftime('%d %B %Y %I:%M:%S %p')}"
+    if send_to_mesh:
+        footer_text += " | Also sent to Meshtastic"
+
     embed = discord.Embed(
         title=f"NOAA Alerts for ZIP {zip_code}",
         description="\n".join(discord_alerts),
         color=0xff0000
     )
-    embed.set_footer(text=f"Requested by {username} at {datetime.now().strftime('%d %B %Y %I:%M:%S %p')}")
+    embed.set_footer(text=footer_text)
     await interaction.followup.send(embed=embed)
 
 # ---------- /wxnow ----------
 @client.tree.command(name="wxnow", description="Shows the current weather report from wxnow file.")
-async def wxnow_command(interaction: discord.Interaction):
-    pass  # leave unchanged
+@app_commands.describe(send_to_mesh="Send weather info to Meshtastic as well")
+async def wxnow_command(interaction: discord.Interaction, send_to_mesh: bool = False):
+    logging.info(f"/wxnow command from {interaction.user.name}, send_to_mesh={send_to_mesh}")
+    await interaction.response.defer(ephemeral=False)
+
+    if not WX_FILE or not os.path.exists(WX_FILE):
+        logging.warning("WX_FILE not found or not configured")
+        await interaction.followup.send("Weather file not found or not configured.", ephemeral=False)
+        return
+
+    try:
+        with open(WX_FILE, "r") as f:
+            lines = f.read().splitlines()
+
+        if len(lines) < 2:
+            report_lines = ["No weather report available."]
+        else:
+            date_line = lines[0].strip()
+            data_line = lines[1].strip()
+            wind_dir = int(data_line[0:3])
+            wind_speed = int(data_line[4:7])
+            wind_gust = int(data_line[data_line.find('g')+1:data_line.find('g')+4])
+            temp = int(data_line[data_line.find('t')+1:data_line.find('t')+4])
+            rain_hour = int(data_line[data_line.find('r')+1:data_line.find('r')+3])/100.0
+            rain_24h = int(data_line[data_line.find('p')+1:data_line.find('p')+3])/100.0
+            rain_since_midnight = int(data_line[data_line.find('P')+1:data_line.find('P')+3])/100.0
+            humidity_raw = int(data_line[data_line.find('h')+1:data_line.find('h')+3])
+            humidity = 100 if humidity_raw == 0 else humidity_raw
+            baro_raw = int(data_line[data_line.find('b')+1:data_line.find('b')+5])
+            baro = baro_raw / 10.0
+
+            report_lines = [
+                f"Flint Hill Weather Report:",
+                f"Date/Time: {date_line}",
+                f"Wind: {wind_dir}° at {wind_speed} mph (Gust {wind_gust} mph)",
+                f"Temp: {temp}°F",
+                f"Rain last hour: {rain_hour} in",
+                f"Rain last 24h: {rain_24h} in",
+                f"Rain since midnight: {rain_since_midnight} in",
+                f"Humidity: {humidity}%",
+                f"Pressure: {baro} mb"
+            ]
+
+        # Send to Discord
+        embed = discord.Embed(
+            title="Flint Hill Weather Report",
+            description="\n".join(report_lines),
+            color=COLOR
+        )
+        footer_text = datetime.now(pytz.timezone(TIME_ZONE)).strftime('%d %B %Y %I:%M:%S %p')
+        if send_to_mesh:
+            footer_text += " | Also sent to Meshtastic"
+        embed.set_footer(text=footer_text)
+        await interaction.followup.send(embed=embed, ephemeral=False)
+
+        # Send line-by-line to Meshtastic if requested
+        if send_to_mesh and client.iface and hasattr(client.iface, "myInfo") and client.iface.myInfo:
+            logging.info("Sending weather report to Meshtastic")
+            def send_lines():
+                for line in report_lines:
+                    client.iface.sendText(line, destinationId="^all", channelIndex=0)
+                    time.sleep(3)
+            await asyncio.get_running_loop().run_in_executor(None, send_lines)
+
+    except Exception as e:
+        logging.error(f"WXnow error: {e}", exc_info=True)
+        await interaction.followup.send(f"Error reading WXnow file: {e}", ephemeral=False)
 
 # ---------------- Run Bot ----------------
 def run_bot():
