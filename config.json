@@ -1,6 +1,7 @@
 {
-  "discord_bot_token": "bot key",
-  "discord_channel_id": "chennel ID",
+  "discord_bot_token": "bot key here",
+  "discord_channel_id": "discord channel ID",
+  "SerialDevice": "/dev/ttyACM0",
   "time_zone": "America/New_York",
   "wx_file": "/home/admin/wxnow.txt",
   "channel_names": {
