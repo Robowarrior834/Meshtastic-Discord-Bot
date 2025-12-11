@@ -44,44 +44,118 @@ nodelistq = queue.Queue()
 
 # ---------------- Helper Functions ----------------
 def get_long_name(node_id, nodes):
-    if node_id in nodes:
-        return nodes[node_id]['user'].get('longName', 'Unknown')
+    try:
+        # nodes keys may be ints or strings; try both if necessary
+        if node_id in nodes:
+            return nodes[node_id]['user'].get('longName', 'Unknown')
+        # fallback: try string/int conversions
+        try:
+            alt_key = int(node_id)
+            if alt_key in nodes:
+                return nodes[alt_key]['user'].get('longName', 'Unknown')
+        except Exception:
+            pass
+        try:
+            alt_key = str(node_id)
+            if alt_key in nodes:
+                return nodes[alt_key]['user'].get('longName', 'Unknown')
+        except Exception:
+            pass
+    except Exception:
+        pass
     return 'Unknown'
 
 def onConnectionMesh(interface, topic=pub.AUTO_TOPIC):
     logging.info(f"Connected to mesh: {interface.myInfo}")
 
 def onReceiveMesh(packet, interface):
+    """
+    Handles received Meshtastic packets and queues a Discord embed for posting.
+    Uses nodes[packet['fromId']]['hopsAway'] to show real hop distance.
+    """
     try:
         if 'decoded' not in packet:
             logging.warning(f"Received packet without 'decoded': {packet}")
             return
 
+        # Only handle text messages (TEXT_MESSAGE_APP)
         if packet['decoded'].get('portnum') != 'TEXT_MESSAGE_APP':
             return
 
+        # channel index might be under packet['channel'] or decoded
         channel_index = packet.get('channel', packet['decoded'].get('channel', 0))
         channel_name = CHANNEL_NAMES.get(channel_index, f"Unknown Channel ({channel_index})")
 
-        nodes = interface.nodes
-        from_long = get_long_name(packet['fromId'], nodes)
-        to_long = 'All Nodes' if packet['toId'] == '^all' else get_long_name(packet['toId'], nodes)
+        nodes = interface.nodes if hasattr(interface, 'nodes') else {}
+        from_long = get_long_name(packet.get('fromId'), nodes)
+        to_long = 'All Nodes' if packet.get('toId') == '^all' else get_long_name(packet.get('toId'), nodes)
 
-        hops = packet.get('hops', 'N/A')  # Log hops if available
-        logging.info(f"Received message from {from_long} to {to_long}, channel {channel_name}, hops={hops}")
+        # Determine real hop distance (hopsAway) from node DB
+        hops_away = '?'
+        try:
+            node_key = packet.get('fromId')
+            # Try multiple key formats
+            if node_key in nodes:
+                hops_away = nodes[node_key].get('hopsAway', '?')
+            else:
+                try:
+                    ik = int(node_key)
+                    if ik in nodes:
+                        hops_away = nodes[ik].get('hopsAway', '?')
+                except Exception:
+                    sk = str(node_key)
+                    if sk in nodes:
+                        hops_away = nodes[sk].get('hopsAway', '?')
+        except Exception:
+            hops_away = '?'
 
+        # Also capture SNR, lastHeard if available
+        snr = '?'
+        last_heard_str = "Unknown"
+        try:
+            if node_key in nodes:
+                snr = nodes[node_key].get('snr', '?')
+                lh = nodes[node_key].get('lastHeard', 0)
+                if lh:
+                    last_heard_str = datetime.fromtimestamp(lh, pytz.timezone(TIME_ZONE)).strftime('%d %B %Y %I:%M:%S %p')
+            else:
+                # Try conversions again for SNR/lastHeard
+                try:
+                    ik = int(node_key)
+                    if ik in nodes:
+                        snr = nodes[ik].get('snr', '?')
+                        lh = nodes[ik].get('lastHeard', 0)
+                        if lh:
+                            last_heard_str = datetime.fromtimestamp(lh, pytz.timezone(TIME_ZONE)).strftime('%d %B %Y %I:%M:%S %p')
+                except Exception:
+                    sk = str(node_key)
+                    if sk in nodes:
+                        snr = nodes[sk].get('snr', '?')
+                        lh = nodes[sk].get('lastHeard', 0)
+                        if lh:
+                            last_heard_str = datetime.fromtimestamp(lh, pytz.timezone(TIME_ZONE)).strftime('%d %B %Y %I:%M:%S %p')
+        except Exception:
+            pass
+
+        logging.info(f"Received message from {from_long} to {to_long}, channel {channel_name}, hopsAway={hops_away}, snr={snr}")
+
+        # Build embed
         embed = discord.Embed(
             title="Message Received",
             description=packet['decoded'].get('text', ''),
             color=COLOR
         )
-        embed.add_field(name="From Node", value=f"{from_long} ({packet['fromId']})", inline=True)
-        if packet['toId'] == '^all':
+        embed.add_field(name="From Node", value=f"{from_long} ({packet.get('fromId')})", inline=True)
+        if packet.get('toId') == '^all':
             embed.add_field(name="To Channel", value=channel_name, inline=True)
         else:
-            embed.add_field(name="To Node", value=f"{to_long} ({packet['toId']})", inline=True)
-        embed.add_field(name="Hops", value=str(hops), inline=True)
-        embed.set_footer(text=datetime.now().strftime('%d %B %Y %I:%M:%S %p'))
+            embed.add_field(name="To Node", value=f"{to_long} ({packet.get('toId')})", inline=True)
+
+        embed.add_field(name="Hops Away", value=str(hops_away), inline=True)
+        embed.add_field(name="SNR", value=str(snr), inline=True)
+        embed.add_field(name="Last Heard", value=last_heard_str, inline=True)
+
+        embed.set_footer(text=datetime.now(pytz.timezone(TIME_ZONE)).strftime('%d %B %Y %I:%M:%S %p'))
 
         meshtodiscord.put(embed)
 
@@ -166,25 +240,32 @@ class MeshBot(discord.Client):
 
             counter += 1
             if counter % 12 == 1:
-                nodelist = ["**Nodes seen in last 15 minutes:**\n"]
-                nodes = self.iface.nodes
-                for node in nodes:
+                # Build nodelist for the last 15 minutes
+                nodelist = ["**Nodes seen in last 6 Hours:**"]
+                nodes = self.iface.nodes if hasattr(self.iface, 'nodes') else {}
+                sorted_nodes = sorted(nodes.keys(), key=lambda n: nodes[n].get("hopsAway", 999))
+
+                for node in sorted_nodes:
                     try:
                         user = nodes[node].get('user', {})
                         last_heard = nodes[node].get('lastHeard', 0)
-                        if time.time() - last_heard <= 15 * 60:
+                        if time.time() - last_heard <= 6 * 60 * 60:
                             last_heard_str = datetime.fromtimestamp(last_heard, pytz.timezone(TIME_ZONE)).strftime('%d %B %Y %I:%M:%S %p') if last_heard else "Unknown"
                             nodelist.append(
-                                f"**ID:** {user.get('id', node)} | **Name:** {user.get('longName', 'Unknown')} | "
-                                f"**Hops:** {nodes[node].get('hopsAway', 0)} | "
+                                f"**ID:** {user.get('id', node)} | "
+                                f"**Name:** {user.get('longName', 'Unknown')} | "
+                                f"**HopsAway:** {nodes[node].get('hopsAway', '?')} | "
                                 f"**SNR:** {nodes[node].get('snr', '?')} | "
                                 f"**Last Heard:** {last_heard_str}"
                             )
                     except Exception:
                         pass
-                nodelist_chunks = ["\n".join(nodelist[i:i+10]) for i in range(0, len(nodelist), 10)]
 
-            # Process mesh -> Discord
+                # --- Chunk into groups of 20 lines ---
+                chunk_size = 10
+                nodelist_chunks = [ "\n".join(nodelist[i:i + chunk_size]) for i in range(0, len(nodelist), chunk_size) ]
+
+            # Process mesh -> Discord (embeds queued by onReceiveMesh)
             try:
                 embed = meshtodiscord.get_nowait()
                 if isinstance(embed, discord.Embed) and public_channel:
@@ -193,7 +274,7 @@ class MeshBot(discord.Client):
             except queue.Empty:
                 pass
 
-            # Process Discord -> mesh
+            # Process Discord -> mesh (messages queued by commands)
             try:
                 msg_data = discordtomesh.get_nowait()
                 text = msg_data['text']
@@ -211,23 +292,27 @@ class MeshBot(discord.Client):
                         description="\n".join(sent_chunks),
                         color=COLOR
                     )
-                    embed.set_footer(text=datetime.now().strftime('%d %B %Y %I:%M:%S %p'))
+                    embed.set_footer(text=datetime.now(pytz.timezone(TIME_ZONE)).strftime('%d %B %Y %I:%M:%S %p'))
                     await public_channel.send(embed=embed)
 
                 discordtomesh.task_done()
             except queue.Empty:
                 pass
 
-            # Process ephemeral node list requests
+            # Process ephemeral node list requests (/active)
             try:
                 interaction = nodelistq.get_nowait()
-                for chunk in nodelist_chunks:
-                    await interaction.followup.send(chunk, ephemeral=True)
+                if not nodelist_chunks:
+                    await interaction.followup.send("No nodes seen in the last 15 minutes.", ephemeral=True)
+                else:
+                    for chunk in nodelist_chunks:
+                        await interaction.followup.send(chunk, ephemeral=True)
                 nodelistq.task_done()
             except queue.Empty:
                 pass
 
             await asyncio.sleep(5)
+
 
 # ---------------- Help View ----------------
 class HelpView(View):
@@ -254,7 +339,8 @@ async def help_command(interaction: discord.Interaction):
                  "`/sendnum` - Send a message to another node.\n"
                  "`/help` - Shows this help message.\n"
                  "`/wxnow` - Shows current weather.\n"
-                 "`/longfast` - Sends a long fast message.\n")
+                 "`/longfast` - Sends a long fast message.\n"
+                 "`/active` - List active nodes seen in the last 15 minutes.\n")
     for idx, name in CHANNEL_NAMES.items():
         if name.lower() not in ["longfast", "wxnow"]:
             help_text += f"`/{name.lower()}` - Send a message in the {name} channel.\n"
@@ -285,6 +371,7 @@ async def sendnum(interaction: discord.Interaction, nodenum: int, message: str):
 
 # ---------- Dynamic Channel Commands ----------
 def create_channel_command(channel_index: int, channel_name: str):
+    # keep reserved names out
     if channel_name.lower() in ["longfast", "wxnow", "help", "noaa_alerts", "sendid", "sendnum", "active"]:
         return
 
@@ -450,6 +537,15 @@ async def wxnow_command(interaction: discord.Interaction, send_to_mesh: bool = F
         logging.error(f"WXnow error: {e}", exc_info=True)
         await interaction.followup.send(f"Error reading WXnow file: {e}", ephemeral=False)
 
+# ---------- /active ----------
+@client.tree.command(name="active", description="List all active nodes seen in the last 15 minutes.")
+async def active_nodes(interaction: discord.Interaction):
+    """
+    Puts the interaction into the nodelistq; the background task will respond with ephemeral chunks.
+    """
+    await interaction.response.defer(ephemeral=True)
+    nodelistq.put(interaction)
+
 # ---------------- Run Bot ----------------
 def run_bot():
     try:
@@ -457,7 +553,11 @@ def run_bot():
     except Exception as e:
         logging.error(f"Bot crashed: {e}")
     finally:
-        asyncio.run(client.close())
+        # attempt graceful close
+        try:
+            asyncio.run(client.close())
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
