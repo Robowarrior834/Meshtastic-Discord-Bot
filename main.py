@@ -32,7 +32,7 @@ TOKEN = config["discord_bot_token"]
 CHANNEL_ID = int(config["discord_channel_id"])
 CHANNEL_NAMES = config["channel_names"]
 TIME_ZONE = config["time_zone"]
-MESHTASTIC_PORT = "/dev/ttyACM0"
+MESHTASTIC_PORT = config["SerialDevice"]
 WX_FILE = config.get("wx_file")
 
 COLOR = 0x67ea94  # Meshtastic green
