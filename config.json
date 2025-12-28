@@ -1,6 +1,6 @@
 {
-  "discord_bot_token": "bot key here",
-  "discord_channel_id": "discord channel ID",
+  "discord_bot_token": "token",
+  "discord_channel_id": "3132163456",
   "SerialDevice": "/dev/ttyACM0",
   "time_zone": "America/New_York",
   "wx_file": "/home/admin/wxnow.txt",
@@ -8,5 +8,6 @@
     "0": "LongFast",
     "1": "Forest-Edge",
     "3": "LVMN"
-  }
+  },
+  "disabled_commands": ["meshdiag"]
 }
