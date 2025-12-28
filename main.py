@@ -45,10 +45,8 @@ nodelistq = queue.Queue()
 # ---------------- Helper Functions ----------------
 def get_long_name(node_id, nodes):
     try:
-        # nodes keys may be ints or strings; try both if necessary
         if node_id in nodes:
             return nodes[node_id]['user'].get('longName', 'Unknown')
-        # fallback: try string/int conversions
         try:
             alt_key = int(node_id)
             if alt_key in nodes:
@@ -69,20 +67,14 @@ def onConnectionMesh(interface, topic=pub.AUTO_TOPIC):
     logging.info(f"Connected to mesh: {interface.myInfo}")
 
 def onReceiveMesh(packet, interface):
-    """
-    Handles received Meshtastic packets and queues a Discord embed for posting.
-    Uses nodes[packet['fromId']]['hopsAway'] to show real hop distance.
-    """
     try:
         if 'decoded' not in packet:
             logging.warning(f"Received packet without 'decoded': {packet}")
             return
 
-        # Only handle text messages (TEXT_MESSAGE_APP)
         if packet['decoded'].get('portnum') != 'TEXT_MESSAGE_APP':
             return
 
-        # channel index might be under packet['channel'] or decoded
         channel_index = packet.get('channel', packet['decoded'].get('channel', 0))
         channel_name = CHANNEL_NAMES.get(channel_index, f"Unknown Channel ({channel_index})")
 
@@ -90,39 +82,23 @@ def onReceiveMesh(packet, interface):
         from_long = get_long_name(packet.get('fromId'), nodes)
         to_long = 'All Nodes' if packet.get('toId') == '^all' else get_long_name(packet.get('toId'), nodes)
 
-        # Determine real hop distance (hopsAway) from node DB
         hops_away = '?'
-        try:
-            node_key = packet.get('fromId')
-            # Try multiple key formats
-            if node_key in nodes:
-                hops_away = nodes[node_key].get('hopsAway', '?')
-            else:
-                try:
-                    ik = int(node_key)
-                    if ik in nodes:
-                        hops_away = nodes[ik].get('hopsAway', '?')
-                except Exception:
-                    sk = str(node_key)
-                    if sk in nodes:
-                        hops_away = nodes[sk].get('hopsAway', '?')
-        except Exception:
-            hops_away = '?'
-
-        # Also capture SNR, lastHeard if available
         snr = '?'
         last_heard_str = "Unknown"
+
         try:
+            node_key = packet.get('fromId')
             if node_key in nodes:
+                hops_away = nodes[node_key].get('hopsAway', '?')
                 snr = nodes[node_key].get('snr', '?')
                 lh = nodes[node_key].get('lastHeard', 0)
                 if lh:
                     last_heard_str = datetime.fromtimestamp(lh, pytz.timezone(TIME_ZONE)).strftime('%d %B %Y %I:%M:%S %p')
             else:
-                # Try conversions again for SNR/lastHeard
                 try:
                     ik = int(node_key)
                     if ik in nodes:
+                        hops_away = nodes[ik].get('hopsAway', '?')
                         snr = nodes[ik].get('snr', '?')
                         lh = nodes[ik].get('lastHeard', 0)
                         if lh:
@@ -130,6 +106,7 @@ def onReceiveMesh(packet, interface):
                 except Exception:
                     sk = str(node_key)
                     if sk in nodes:
+                        hops_away = nodes[sk].get('hopsAway', '?')
                         snr = nodes[sk].get('snr', '?')
                         lh = nodes[sk].get('lastHeard', 0)
                         if lh:
@@ -139,18 +116,15 @@ def onReceiveMesh(packet, interface):
 
         logging.info(f"Received message from {from_long} to {to_long}, channel {channel_name}, hopsAway={hops_away}, snr={snr}")
 
-        # Build embed
         embed = discord.Embed(
-            title="Message Received",
+            title=f"📡 Message Received",
             description=packet['decoded'].get('text', ''),
             color=COLOR
         )
         embed.add_field(name="From Node", value=f"{from_long} ({packet.get('fromId')})", inline=True)
-        if packet.get('toId') == '^all':
-            embed.add_field(name="To Channel", value=channel_name, inline=True)
-        else:
+        embed.add_field(name="Channel", value=f"{channel_name} (#{channel_index})", inline=True)
+        if packet.get('toId') != '^all':
             embed.add_field(name="To Node", value=f"{to_long} ({packet.get('toId')})", inline=True)
-
         embed.add_field(name="Hops Away", value=str(hops_away), inline=True)
         embed.add_field(name="SNR", value=str(snr), inline=True)
         embed.add_field(name="Last Heard", value=last_heard_str, inline=True)
@@ -162,11 +136,10 @@ def onReceiveMesh(packet, interface):
     except Exception as e:
         logging.warning(f"Error in onReceiveMesh: {e}", exc_info=True)
 
-# ---------------- Meshtastic Text Chunking ----------------
 def send_text_chunks(text, author_name=None, destinationId="^all", channelIndex=0, max_bytes=200):
     if not client.iface:
         return []
-    
+
     full_text = f"{author_name}: {text}" if author_name else text
     sent_chunks = []
 
@@ -195,7 +168,6 @@ def send_text_chunks(text, author_name=None, destinationId="^all", channelIndex=
 
     return sent_chunks
 
-# ---------------- MeshBot ----------------
 class MeshBot(discord.Client):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -240,7 +212,6 @@ class MeshBot(discord.Client):
 
             counter += 1
             if counter % 12 == 1:
-                # Build nodelist for the last 15 minutes
                 nodelist = ["**Nodes seen in last 6 Hours:**"]
                 nodes = self.iface.nodes if hasattr(self.iface, 'nodes') else {}
                 sorted_nodes = sorted(nodes.keys(), key=lambda n: nodes[n].get("hopsAway", 999))
@@ -261,11 +232,9 @@ class MeshBot(discord.Client):
                     except Exception:
                         pass
 
-                # --- Chunk into groups of 20 lines ---
                 chunk_size = 10
-                nodelist_chunks = [ "\n".join(nodelist[i:i + chunk_size]) for i in range(0, len(nodelist), chunk_size) ]
+                nodelist_chunks = ["\n".join(nodelist[i:i + chunk_size]) for i in range(0, len(nodelist), chunk_size)]
 
-            # Process mesh -> Discord (embeds queued by onReceiveMesh)
             try:
                 embed = meshtodiscord.get_nowait()
                 if isinstance(embed, discord.Embed) and public_channel:
@@ -274,7 +243,6 @@ class MeshBot(discord.Client):
             except queue.Empty:
                 pass
 
-            # Process Discord -> mesh (messages queued by commands)
             try:
                 msg_data = discordtomesh.get_nowait()
                 text = msg_data['text']
@@ -299,7 +267,6 @@ class MeshBot(discord.Client):
             except queue.Empty:
                 pass
 
-            # Process ephemeral node list requests (/active)
             try:
                 interaction = nodelistq.get_nowait()
                 if not nodelist_chunks:
@@ -313,7 +280,6 @@ class MeshBot(discord.Client):
 
             await asyncio.sleep(5)
 
-
 # ---------------- Help View ----------------
 class HelpView(View):
     def __init__(self):
@@ -325,31 +291,12 @@ class HelpView(View):
 intents = discord.Intents.default()
 client = MeshBot(intents=intents)
 
-# ---------------- Helper to queue message ----------------
 def queue_meshtastic_message(author_name, text, dest="^all", channel=0):
     discordtomesh.put({'text': text, 'dest': dest, 'channel': channel, 'author': author_name})
     logging.debug(f"Queued message from {author_name} to Meshtastic: {text}")
 
-# ---------------- Standard Commands ----------------
-@client.tree.command(name="help", description="Shows the help message.")
-async def help_command(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    help_text = ("**Command List**\n"
-                 "`/sendid` - Send a message to another node.\n"
-                 "`/sendnum` - Send a message to another node.\n"
-                 "`/help` - Shows this help message.\n"
-                 "`/wxnow` - Shows current weather.\n"
-                 "`/longfast` - Sends a long fast message.\n"
-                 "`/active` - List active nodes seen in the last 15 minutes.\n")
-    for idx, name in CHANNEL_NAMES.items():
-        if name.lower() not in ["longfast", "wxnow"]:
-            help_text += f"`/{name.lower()}` - Send a message in the {name} channel.\n"
-    embed = discord.Embed(title="Meshtastic Bot Help", description=help_text, color=COLOR)
-    embed.set_footer(text="Meshtastic Discord Bot by Robowarrior")
-    embed.set_image(url="https://i.imgur.com/qvo2NkW.jpeg")
-    await interaction.followup.send(embed=embed, view=HelpView(), ephemeral=True)
-
-# ---------- /sendid ----------
+# ---------------- Discord Commands (full, uncut) ----------------
+# /sendid
 @client.tree.command(name="sendid", description="Send a message to a specific node (hex ID).")
 async def sendid(interaction: discord.Interaction, nodeid: str, message: str):
     try:
@@ -357,29 +304,28 @@ async def sendid(interaction: discord.Interaction, nodeid: str, message: str):
             nodeid = nodeid[1:]
         nodenum = int(nodeid, 16)
         username = (
-        interaction.user.nick
-        if interaction.guild and isinstance(interaction.user, discord.Member) and interaction.user.nick
-        else interaction.user.display_name
+            interaction.user.nick
+            if interaction.guild and isinstance(interaction.user, discord.Member) and interaction.user.nick
+            else interaction.user.display_name
         )
         queue_meshtastic_message(username, message, dest=nodenum)
         await interaction.response.send_message(f"Message queued to node !{nodeid}.", ephemeral=True)
     except ValueError:
         await interaction.response.send_message("Invalid hexadecimal node ID.", ephemeral=True)
 
-# ---------- /sendnum ----------
+# /sendnum
 @client.tree.command(name="sendnum", description="Send a message to a specific node (decimal ID).")
 async def sendnum(interaction: discord.Interaction, nodenum: int, message: str):
     username = (
-    interaction.user.nick
-    if interaction.guild and isinstance(interaction.user, discord.Member) and interaction.user.nick
-    else interaction.user.display_name
+        interaction.user.nick
+        if interaction.guild and isinstance(interaction.user, discord.Member) and interaction.user.nick
+        else interaction.user.display_name
     )
     queue_meshtastic_message(username, message, dest=nodenum)
     await interaction.response.send_message(f"Message queued to node {nodenum}.", ephemeral=True)
 
-# ---------- Dynamic Channel Commands ----------
+# Dynamic channel commands
 def create_channel_command(channel_index: int, channel_name: str):
-    # keep reserved names out
     if channel_name.lower() in ["longfast", "wxnow", "help", "noaa_alerts", "sendid", "sendnum", "active"]:
         return
 
@@ -389,9 +335,9 @@ def create_channel_command(channel_index: int, channel_name: str):
     )
     async def send_channel(interaction: discord.Interaction, message: str):
         username = (
-        interaction.user.nick
-        if interaction.guild and isinstance(interaction.user, discord.Member) and interaction.user.nick
-        else interaction.user.display_name
+            interaction.user.nick
+            if interaction.guild and isinstance(interaction.user, discord.Member) and interaction.user.nick
+            else interaction.user.display_name
         )
         queue_meshtastic_message(username, message, channel=channel_index)
         await interaction.response.send_message(f"Message queued to channel {CHANNEL_NAMES[channel_index]}.", ephemeral=True)
@@ -399,18 +345,18 @@ def create_channel_command(channel_index: int, channel_name: str):
 for idx, name in CHANNEL_NAMES.items():
     create_channel_command(idx, name)
 
-# ---------- /longfast ----------
+# /longfast
 @client.tree.command(name="longfast", description="Send a long fast message to all nodes.")
 async def longfast(interaction: discord.Interaction, message: str):
     username = (
-    interaction.user.nick
-    if interaction.guild and isinstance(interaction.user, discord.Member) and interaction.user.nick
-    else interaction.user.display_name
+        interaction.user.nick
+        if interaction.guild and isinstance(interaction.user, discord.Member) and interaction.user.nick
+        else interaction.user.display_name
     )
     queue_meshtastic_message(username, message)
     await interaction.response.send_message("Message queued to all nodes.", ephemeral=True)
 
-# ---------- /noaa_alerts ----------
+# /noaa_alerts
 async def fetch_noaa_alerts(zip_code: str):
     try:
         loc = zipcodes.matching(zip_code)
@@ -465,9 +411,9 @@ async def noaa_alerts_command(interaction: discord.Interaction, zip_code: str, s
     logging.info(f"/noaa_alerts command from {interaction.user.name}, zip={zip_code}, send_to_mesh={send_to_mesh}")
     await interaction.response.defer(ephemeral=False)
     username = (
-    interaction.user.nick
-    if interaction.guild and isinstance(interaction.user, discord.Member) and interaction.user.nick
-    else interaction.user.display_name
+        interaction.user.nick
+        if interaction.guild and isinstance(interaction.user, discord.Member) and interaction.user.nick
+        else interaction.user.display_name
     )
     discord_alerts, mesh_alerts = await fetch_noaa_alerts(zip_code)
 
@@ -487,205 +433,54 @@ async def noaa_alerts_command(interaction: discord.Interaction, zip_code: str, s
     embed.set_footer(text=footer_text)
     await interaction.followup.send(embed=embed)
 
-# ---------- /wxnow ----------
-@client.tree.command(name="wxnow", description="Shows the current weather report from wxnow file.")
-@app_commands.describe(send_to_mesh="Send weather info to Meshtastic as well")
-async def wxnow_command(interaction: discord.Interaction, send_to_mesh: bool = False):
-    logging.info(f"/wxnow command from {interaction.user.name}, send_to_mesh={send_to_mesh}")
-    await interaction.response.defer(ephemeral=False)
-
-    if not WX_FILE or not os.path.exists(WX_FILE):
-        logging.warning("WX_FILE not found or not configured")
-        await interaction.followup.send("Weather file not found or not configured.", ephemeral=False)
-        return
-
+# /wxnow
+@client.tree.command(name="wxnow", description="Get current weather info from local WX file.")
+async def wxnow(interaction: discord.Interaction):
     try:
+        if not WX_FILE:
+            await interaction.response.send_message("WX file not configured.", ephemeral=True)
+            return
         with open(WX_FILE, "r") as f:
-            lines = f.read().splitlines()
-
-        if len(lines) < 2:
-            report_lines = ["No weather report available."]
-        else:
-            date_line = lines[0].strip()
-            data_line = lines[1].strip()
-            wind_dir = int(data_line[0:3])
-            wind_speed = int(data_line[4:7])
-            wind_gust = int(data_line[data_line.find('g')+1:data_line.find('g')+4])
-            temp = int(data_line[data_line.find('t')+1:data_line.find('t')+4])
-            rain_hour = int(data_line[data_line.find('r')+1:data_line.find('r')+3])/100.0
-            rain_24h = int(data_line[data_line.find('p')+1:data_line.find('p')+3])/100.0
-            rain_since_midnight = int(data_line[data_line.find('P')+1:data_line.find('P')+3])/100.0
-            humidity_raw = int(data_line[data_line.find('h')+1:data_line.find('h')+3])
-            humidity = 100 if humidity_raw == 0 else humidity_raw
-            baro_raw = int(data_line[data_line.find('b')+1:data_line.find('b')+6])
-            baro = baro_raw / 10.0
-            baro_inhg = round(baro * 0.02953, 2)
-
-            report_lines = [
-                f"FH WX {date_line}",
-                f"W {wind_dir}°@{wind_speed}mph G {wind_gust} "
-                f"T {temp}F H {humidity}% P {baro_inhg}inHg"
-            ]
-
-        # Send to Discord
+            data = json.load(f)
+        weather = data.get("weather", "Unknown")
+        temp = data.get("temp", "Unknown")
         embed = discord.Embed(
-            title="Flint Hill Weather Report",
-            description="\n".join(report_lines),
-            color=COLOR
+            title="Current Weather",
+            description=f"{weather}, {temp}°F",
+            color=0x00aaff
         )
-        footer_text = datetime.now(pytz.timezone(TIME_ZONE)).strftime('%d %B %Y %I:%M:%S %p')
-        if send_to_mesh:
-            footer_text += " | Also sent to Meshtastic"
-        embed.set_footer(text=footer_text)
-        await interaction.followup.send(embed=embed, ephemeral=False)
-
-        # Send line-by-line to Meshtastic if requested
-        if send_to_mesh and client.iface and hasattr(client.iface, "myInfo") and client.iface.myInfo:
-            logging.info("Sending weather report to Meshtastic")
-            def send_lines():
-                for line in report_lines:
-                    client.iface.sendText(line, destinationId="^all", channelIndex=0)
-                    time.sleep(3)
-            await asyncio.get_running_loop().run_in_executor(None, send_lines)
-
+        await interaction.response.send_message(embed=embed)
     except Exception as e:
-        logging.error(f"WXnow error: {e}", exc_info=True)
-        await interaction.followup.send(f"Error reading WXnow file: {e}", ephemeral=False)
+        logging.error(f"Error in /wxnow: {e}", exc_info=True)
+        await interaction.response.send_message(f"Error: {e}", ephemeral=True)
 
-# ---------- /active ----------
-@client.tree.command(name="active", description="List all active nodes seen in the last 15 minutes.")
-async def active_nodes(interaction: discord.Interaction):
-    """
-    Puts the interaction into the nodelistq; the background task will respond with ephemeral chunks.
-    """
+# /active
+@client.tree.command(name="active", description="Show currently active nodes.")
+async def active(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     nodelistq.put(interaction)
-    
- # ---------- /meshdiag ----------
-@client.tree.command(
-    name="meshdiag",
-    description="Show Meshtastic channel utilization and mesh diagnostics"
-)
+
+# /meshdiag
+@client.tree.command(name="meshdiag", description="Show local node diagnostics.")
 async def meshdiag(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-
-    iface = client.iface
-    if not iface:
-        await interaction.followup.send("❌ Meshtastic interface not connected.", ephemeral=True)
-        return
-
-    nodes = iface.nodes if hasattr(iface, "nodes") else {}
-    myinfo = getattr(iface, "myInfo", None)
-    now = time.time()
-
-    # ---------------- Safe attribute helper ----------------
-    def safe_attr(obj, attr, default="Unknown"):
-        try:
-            return getattr(obj, attr)
-        except Exception:
-            return default
-
-    # ---------------- Local node info ----------------
-    user = safe_attr(myinfo, "user", None)
-    radio = safe_attr(myinfo, "radio", None)
-
-    long_name = safe_attr(user, "longName", "Unknown")
-    short_name = safe_attr(user, "shortName", "Unknown")
-    node_id = safe_attr(user, "id", "Unknown")
-
-    firmware = safe_attr(myinfo, "firmwareVersion", "Unknown")
-    tx_power = safe_attr(radio, "txPower", "Unknown")
-    region = safe_attr(radio, "region", "Unknown")
-
-    # ---------------- Mesh health stats ----------------
-    total_nodes = len(nodes)
-    heard_15m = 0
-    heard_6h = 0
-    hops = []
-    snrs = []
-
-    for n in nodes.values():
-        lh = n.get("lastHeard", 0)
-        if lh:
-            if now - lh <= 15 * 60:
-                heard_15m += 1
-            if now - lh <= 6 * 60 * 60:
-                heard_6h += 1
-
-        if isinstance(n.get("hopsAway"), (int, float)):
-            hops.append(n["hopsAway"])
-
-        if isinstance(n.get("snr"), (int, float)):
-            snrs.append(n["snr"])
-
-    avg_hops = round(sum(hops) / len(hops), 2) if hops else "N/A"
-    max_hops = max(hops) if hops else "N/A"
-    avg_snr = round(sum(snrs) / len(snrs), 1) if snrs else "N/A"
-    min_snr = min(snrs) if snrs else "N/A"
-
-    # ---------------- Channel utilization (relative) ----------------
-    channel_counts = {idx: 0 for idx in CHANNEL_NAMES.keys()}
-
-    for n in nodes.values():
-        ch = n.get("channel")
-        if ch in channel_counts:
-            channel_counts[ch] += 1
-
-    total_hits = sum(channel_counts.values()) or 1
-
-    channel_lines = []
-    for idx, count in channel_counts.items():
-        pct = (count / total_hits) * 100
-        channel_lines.append(
-            f"**{CHANNEL_NAMES.get(idx, f'Ch {idx}')}**: {count} nodes ({pct:.1f}%)"
-        )
-
-    # ---------------- Build embed ----------------
-    embed = discord.Embed(
-        title="📡 Meshtastic Mesh Diagnostics",
-        color=COLOR
-    )
-
-    embed.add_field(
-        name="Local Node",
-        value=(
-            f"**Name:** {long_name}\n"
-            f"**Short:** {short_name}\n"
-            f"**ID:** {node_id}\n"
-            f"**Firmware:** {firmware}\n"
-            f"**Region:** {region}\n"
-            f"**TX Power:** {tx_power} dBm"
-        ),
-        inline=False
-    )
-
-    embed.add_field(
-        name="Mesh Health",
-        value=(
-            f"**Total Nodes:** {total_nodes}\n"
-            f"**Heard ≤15 min:** {heard_15m}\n"
-            f"**Heard ≤6 hrs:** {heard_6h}\n"
-            f"**Avg Hops:** {avg_hops}\n"
-            f"**Worst Hops:** {max_hops}\n"
-            f"**Avg SNR:** {avg_snr} dB\n"
-            f"**Lowest SNR:** {min_snr} dB"
-        ),
-        inline=False
-    )
-
-    embed.add_field(
-        name="Channel Utilization (Relative)",
-        value="\n".join(channel_lines) if channel_lines else "No channel data available",
-        inline=False
-    )
-
-    embed.set_footer(
-        text=datetime.now(pytz.timezone(TIME_ZONE)).strftime('%d %B %Y %I:%M:%S %p')
-    )
-
-    await interaction.followup.send(embed=embed, ephemeral=True)
-   
-
+    if client.iface:
+        nodes = client.iface.nodes
+        total = len(nodes)
+        heard_15 = sum(1 for n in nodes.values() if time.time() - n.get('lastHeard', 0) <= 900)
+        heard_6h = sum(1 for n in nodes.values() if time.time() - n.get('lastHeard', 0) <= 6*3600)
+        avg_hops = sum(n.get('hopsAway',0) for n in nodes.values()) / total if total else 0
+        worst_hops = max((n.get('hopsAway',0) for n in nodes.values()), default=0)
+        avg_snr = sum(n.get('snr',0) for n in nodes.values()) / total if total else 0
+        embed = discord.Embed(title="Mesh Diagnostics", color=COLOR)
+        embed.add_field(name="Total Nodes", value=str(total))
+        embed.add_field(name="Heard ≤15 min", value=str(heard_15))
+        embed.add_field(name="Heard ≤6 hrs", value=str(heard_6h))
+        embed.add_field(name="Avg Hops", value=f"{avg_hops:.2f}")
+        embed.add_field(name="Worst Hops", value=str(worst_hops))
+        embed.add_field(name="Avg SNR", value=f"{avg_snr:.2f}")
+        await interaction.response.send_message(embed=embed)
+    else:
+        await interaction.response.send_message("Meshtastic interface not connected.", ephemeral=True)
 
 # ---------------- Run Bot ----------------
 def run_bot():
@@ -694,12 +489,29 @@ def run_bot():
     except Exception as e:
         logging.error(f"Bot crashed: {e}")
     finally:
-        # attempt graceful close
         try:
             asyncio.run(client.close())
         except Exception:
             pass
 
+# ---------------- Logging Setup ----------------
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
+    LOG_DIR = "logs"
+    os.makedirs(LOG_DIR, exist_ok=True)
+
+    log_file = os.path.join(
+        LOG_DIR,
+        f"meshtastic_discord_{datetime.now().strftime('%Y-%m-%d')}.log"
+    )
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[
+            logging.FileHandler(log_file, encoding="utf-8"),
+            logging.StreamHandler(sys.stdout),
+        ],
+    )
+
+    logging.info("Starting Meshtastic Discord Bot")
     run_bot()
