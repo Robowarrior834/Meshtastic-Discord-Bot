@@ -356,7 +356,11 @@ async def sendid(interaction: discord.Interaction, nodeid: str, message: str):
         if nodeid.startswith("!"):
             nodeid = nodeid[1:]
         nodenum = int(nodeid, 16)
-        username = interaction.user.name
+        username = (
+        interaction.user.nick
+        if interaction.guild and isinstance(interaction.user, discord.Member) and interaction.user.nick
+        else interaction.user.display_name
+        )
         queue_meshtastic_message(username, message, dest=nodenum)
         await interaction.response.send_message(f"Message queued to node !{nodeid}.", ephemeral=True)
     except ValueError:
@@ -365,7 +369,11 @@ async def sendid(interaction: discord.Interaction, nodeid: str, message: str):
 # ---------- /sendnum ----------
 @client.tree.command(name="sendnum", description="Send a message to a specific node (decimal ID).")
 async def sendnum(interaction: discord.Interaction, nodenum: int, message: str):
-    username = interaction.user.name
+    username = (
+    interaction.user.nick
+    if interaction.guild and isinstance(interaction.user, discord.Member) and interaction.user.nick
+    else interaction.user.display_name
+    )
     queue_meshtastic_message(username, message, dest=nodenum)
     await interaction.response.send_message(f"Message queued to node {nodenum}.", ephemeral=True)
 
@@ -380,7 +388,11 @@ def create_channel_command(channel_index: int, channel_name: str):
         description=f"Send a message to the {channel_name} channel."
     )
     async def send_channel(interaction: discord.Interaction, message: str):
-        username = interaction.user.name
+        username = (
+        interaction.user.nick
+        if interaction.guild and isinstance(interaction.user, discord.Member) and interaction.user.nick
+        else interaction.user.display_name
+        )
         queue_meshtastic_message(username, message, channel=channel_index)
         await interaction.response.send_message(f"Message queued to channel {CHANNEL_NAMES[channel_index]}.", ephemeral=True)
 
@@ -390,7 +402,11 @@ for idx, name in CHANNEL_NAMES.items():
 # ---------- /longfast ----------
 @client.tree.command(name="longfast", description="Send a long fast message to all nodes.")
 async def longfast(interaction: discord.Interaction, message: str):
-    username = interaction.user.name
+    username = (
+    interaction.user.nick
+    if interaction.guild and isinstance(interaction.user, discord.Member) and interaction.user.nick
+    else interaction.user.display_name
+    )
     queue_meshtastic_message(username, message)
     await interaction.response.send_message("Message queued to all nodes.", ephemeral=True)
 
@@ -448,7 +464,11 @@ async def fetch_noaa_alerts(zip_code: str):
 async def noaa_alerts_command(interaction: discord.Interaction, zip_code: str, send_to_mesh: bool = False):
     logging.info(f"/noaa_alerts command from {interaction.user.name}, zip={zip_code}, send_to_mesh={send_to_mesh}")
     await interaction.response.defer(ephemeral=False)
-    username = interaction.user.name
+    username = (
+    interaction.user.nick
+    if interaction.guild and isinstance(interaction.user, discord.Member) and interaction.user.nick
+    else interaction.user.display_name
+    )
     discord_alerts, mesh_alerts = await fetch_noaa_alerts(zip_code)
 
     if send_to_mesh:
@@ -497,19 +517,14 @@ async def wxnow_command(interaction: discord.Interaction, send_to_mesh: bool = F
             rain_since_midnight = int(data_line[data_line.find('P')+1:data_line.find('P')+3])/100.0
             humidity_raw = int(data_line[data_line.find('h')+1:data_line.find('h')+3])
             humidity = 100 if humidity_raw == 0 else humidity_raw
-            baro_raw = int(data_line[data_line.find('b')+1:data_line.find('b')+5])
+            baro_raw = int(data_line[data_line.find('b')+1:data_line.find('b')+6])
             baro = baro_raw / 10.0
+            baro_inhg = round(baro * 0.02953, 2)
 
             report_lines = [
-                f"Flint Hill Weather Report:",
-                f"Date/Time: {date_line}",
-                f"Wind: {wind_dir}° at {wind_speed} mph (Gust {wind_gust} mph)",
-                f"Temp: {temp}°F",
-                f"Rain last hour: {rain_hour} in",
-                f"Rain last 24h: {rain_24h} in",
-                f"Rain since midnight: {rain_since_midnight} in",
-                f"Humidity: {humidity}%",
-                f"Pressure: {baro} mb"
+                f"FH WX {date_line}",
+                f"W {wind_dir}°@{wind_speed}mph G {wind_gust} "
+                f"T {temp}F H {humidity}% P {baro_inhg}inHg"
             ]
 
         # Send to Discord
@@ -545,6 +560,132 @@ async def active_nodes(interaction: discord.Interaction):
     """
     await interaction.response.defer(ephemeral=True)
     nodelistq.put(interaction)
+    
+ # ---------- /meshdiag ----------
+@client.tree.command(
+    name="meshdiag",
+    description="Show Meshtastic channel utilization and mesh diagnostics"
+)
+async def meshdiag(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+
+    iface = client.iface
+    if not iface:
+        await interaction.followup.send("❌ Meshtastic interface not connected.", ephemeral=True)
+        return
+
+    nodes = iface.nodes if hasattr(iface, "nodes") else {}
+    myinfo = getattr(iface, "myInfo", None)
+    now = time.time()
+
+    # ---------------- Safe attribute helper ----------------
+    def safe_attr(obj, attr, default="Unknown"):
+        try:
+            return getattr(obj, attr)
+        except Exception:
+            return default
+
+    # ---------------- Local node info ----------------
+    user = safe_attr(myinfo, "user", None)
+    radio = safe_attr(myinfo, "radio", None)
+
+    long_name = safe_attr(user, "longName", "Unknown")
+    short_name = safe_attr(user, "shortName", "Unknown")
+    node_id = safe_attr(user, "id", "Unknown")
+
+    firmware = safe_attr(myinfo, "firmwareVersion", "Unknown")
+    tx_power = safe_attr(radio, "txPower", "Unknown")
+    region = safe_attr(radio, "region", "Unknown")
+
+    # ---------------- Mesh health stats ----------------
+    total_nodes = len(nodes)
+    heard_15m = 0
+    heard_6h = 0
+    hops = []
+    snrs = []
+
+    for n in nodes.values():
+        lh = n.get("lastHeard", 0)
+        if lh:
+            if now - lh <= 15 * 60:
+                heard_15m += 1
+            if now - lh <= 6 * 60 * 60:
+                heard_6h += 1
+
+        if isinstance(n.get("hopsAway"), (int, float)):
+            hops.append(n["hopsAway"])
+
+        if isinstance(n.get("snr"), (int, float)):
+            snrs.append(n["snr"])
+
+    avg_hops = round(sum(hops) / len(hops), 2) if hops else "N/A"
+    max_hops = max(hops) if hops else "N/A"
+    avg_snr = round(sum(snrs) / len(snrs), 1) if snrs else "N/A"
+    min_snr = min(snrs) if snrs else "N/A"
+
+    # ---------------- Channel utilization (relative) ----------------
+    channel_counts = {idx: 0 for idx in CHANNEL_NAMES.keys()}
+
+    for n in nodes.values():
+        ch = n.get("channel")
+        if ch in channel_counts:
+            channel_counts[ch] += 1
+
+    total_hits = sum(channel_counts.values()) or 1
+
+    channel_lines = []
+    for idx, count in channel_counts.items():
+        pct = (count / total_hits) * 100
+        channel_lines.append(
+            f"**{CHANNEL_NAMES.get(idx, f'Ch {idx}')}**: {count} nodes ({pct:.1f}%)"
+        )
+
+    # ---------------- Build embed ----------------
+    embed = discord.Embed(
+        title="📡 Meshtastic Mesh Diagnostics",
+        color=COLOR
+    )
+
+    embed.add_field(
+        name="Local Node",
+        value=(
+            f"**Name:** {long_name}\n"
+            f"**Short:** {short_name}\n"
+            f"**ID:** {node_id}\n"
+            f"**Firmware:** {firmware}\n"
+            f"**Region:** {region}\n"
+            f"**TX Power:** {tx_power} dBm"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="Mesh Health",
+        value=(
+            f"**Total Nodes:** {total_nodes}\n"
+            f"**Heard ≤15 min:** {heard_15m}\n"
+            f"**Heard ≤6 hrs:** {heard_6h}\n"
+            f"**Avg Hops:** {avg_hops}\n"
+            f"**Worst Hops:** {max_hops}\n"
+            f"**Avg SNR:** {avg_snr} dB\n"
+            f"**Lowest SNR:** {min_snr} dB"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="Channel Utilization (Relative)",
+        value="\n".join(channel_lines) if channel_lines else "No channel data available",
+        inline=False
+    )
+
+    embed.set_footer(
+        text=datetime.now(pytz.timezone(TIME_ZONE)).strftime('%d %B %Y %I:%M:%S %p')
+    )
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
+   
+
 
 # ---------------- Run Bot ----------------
 def run_bot():
